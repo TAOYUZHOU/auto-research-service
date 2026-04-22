@@ -13,7 +13,11 @@ source "${SCRIPT_DIR}/../env.sh"
 : "${WORK_DIR:?WORK_DIR not set}"
 
 TAG="# harness-auto-research"
-TICK_CMD="cd ${SERVICE_ROOT} && source env.sh && /usr/bin/python3 scripts/poll_tick.py >> ${WORK_DIR}/.state/tick.log 2>&1 ${TAG}"
+# Wrap in bash -lc because cron's default /bin/sh (dash) lacks `source`,
+# `BASH_SOURCE`, and `set -o pipefail` — all of which env.sh relies on.
+# The single-quote heredoc-ish form keeps the inner string verbatim so
+# cron's % is not misinterpreted.
+TICK_CMD="/bin/bash -lc 'cd ${SERVICE_ROOT} && source env.sh && /usr/bin/python3 scripts/poll_tick.py' >> ${WORK_DIR}/.state/tick.log 2>&1 ${TAG}"
 
 ACTION="${1:-status}"
 
