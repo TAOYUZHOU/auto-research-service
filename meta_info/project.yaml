@@ -44,6 +44,21 @@ harness:
       primary_metric: best_val_mae
       metric_op: lt              # lt = lower is better
       stop_threshold: 0.05       # baseline 0.0662 → ~24% improvement target
+      # -- Dataset fingerprint (silent ground-truth shift detector) --------
+      # poll_tick.py computes SHA256+mtime+size of each path on every tick;
+      # if any hash differs from .state/data_fingerprint.json, drift is
+      # reported. on_change controls automatic response:
+      #   invalidate_anchor -> reset best_metric.txt to inf, force PROGRAM
+      #                        SYNC, inject DATASET DRIFT alert into prompt
+      #   alert_only        -> only inject the alert; anchor untouched
+      # First-sight (no prior fingerprint on disk) silently records the
+      # current state without raising drift. Paths are relative to repo_path.
+      dataset_fingerprint:
+        on_change: invalidate_anchor
+        paths:
+          - tlc/merged_data_molecule_split_v2_rf_stratified_heavy70_descriptor_aug_extreme/cleaned/train_data.csv
+          - tlc/merged_data_molecule_split_v2_rf_stratified_heavy70_descriptor_aug_extreme/cleaned/valid_data.csv
+          - tlc/merged_data_molecule_split_v2_rf_stratified_heavy70_descriptor_aug_extreme/cleaned/test_data.csv
 
   # -- Agent runtime --
   agent:
@@ -157,6 +172,19 @@ userprompt:
       吃满(从 256/512 起步, OOM 再下调一档),减少梯度噪声和 wall-clock。
       同时确保 lr 随 batch_size 线性放大或开 LR warmup 以避免震荡。仅当显式
       想做 small-batch 正则化研究时才回到 bs=128。
+
+    # -- Architecture exploration quota --------------------------------------
+    - >
+      探索 / 利用平衡:每 5 个连续 plan 中至少有 1 个 axis 标为
+      "architecture"(模型结构、特征 pipeline、loss 分支、auxiliary task、
+      ensemble/stacking、新读出头之类的真正动模型/数据流的改动);其余可继续
+      做 HP / schedule 微调。判定方法:回看 plan.md 里最近 5 个 PLAN_ID 的
+      axis 字段,若全部命中关键词 weight_decay / batch_size / lr / dropout /
+      regression_loss / freeze / warmup / schedule 等纯 HP/schedule 词,则
+      下一个 plan 必须是 architecture 类,即使预期失败概率较高。架构 plan 的
+      motivation 段必须引用至少 2 个最近的 HP 实验作为"HP 空间已穷尽"的
+      pruning 证据,并在 add_by_HARP/ 下放新的 .py 文件或在 editable_files
+      内的模型代码段做实质性结构改动(不仅仅是改超参)。
 
   notes: |
     Baseline 训练时长:161 epoch * ~175s/epoch ≈ 8 小时(单卡)。

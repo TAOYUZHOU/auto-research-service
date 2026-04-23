@@ -9,6 +9,9 @@
 #
 # Outputs in WORK_DIR (B):
 #   harness.yaml      ← rendered from project.yaml::harness
+#                       (verbatim yaml.safe_dump, so any new keys you add
+#                       to project.yaml::harness — e.g. dataset_fingerprint
+#                       under a target — are carried through automatically)
 #   userprompt.yaml   ← rendered from project.yaml::userprompt
 #   .cursorrules      ← rendered from project.yaml::cursorrules with
 #                       ${KERMT_ROOT}/${SERVICE_ROOT}/${WORK_DIR} substituted

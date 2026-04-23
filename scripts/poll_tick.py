@@ -512,6 +512,178 @@ def format_inflight_for_prompt(inflight: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
+# ── Dataset fingerprint (silent ground-truth shift detector) ──
+#
+# Why: HARP's anchor (best_metric.txt) is a single scalar; if the user
+# silently swaps the underlying training/val/test split, every subsequent
+# tick will compare new-split runs against an old-split anchor → totally
+# bogus "below_expect" verdicts and irrecoverable agent confusion. The
+# 2026-04-22 KERMT incident (data_v2_cleaned re-split with
+# literature_reference_level_split) is the worked example.
+#
+# Mechanism: per-target `dataset_fingerprint.paths` lists files that
+# define the ground truth (typically the train/valid/test csvs). Every
+# tick, we compute SHA256+mtime+size of each, persist to
+# .state/data_fingerprint.json, and compare against the previous
+# snapshot. First-sight is silent (no drift = no prior baseline to
+# compare against). Subsequent mismatches trigger the configured action.
+#
+# Configuration (in WORK_DIR/harness.yaml::targets[*]):
+#     dataset_fingerprint:
+#       on_change: invalidate_anchor   # invalidate_anchor | alert_only
+#       paths:
+#         - tlc/data/train.csv
+#         - tlc/data/val.csv
+#         - tlc/data/test.csv
+#
+# Behaviours:
+#   invalidate_anchor — reset best_metric.txt to ±inf (depending on
+#                       metric_op), clear userprompt.sha256 to force a
+#                       PROGRAM SYNC, and inject a top-of-prompt alert
+#                       so the agent's first action is to re-baseline.
+#   alert_only        — only inject the alert; anchor untouched. Useful
+#                       when the swap is intentional and known-equivalent.
+
+DATA_FINGERPRINT_FILE = STATE_DIR / "data_fingerprint.json"
+
+
+def _compute_data_fingerprint(target: dict) -> dict:
+    """SHA256 + mtime + size for each path declared in
+    `target.dataset_fingerprint.paths`. Empty dict if no paths configured."""
+    cfg = (target.get("dataset_fingerprint") or {})
+    paths = cfg.get("paths") or []
+    repo = Path(target.get("repo_path", ""))
+    out: dict = {}
+    for rel in paths:
+        p = Path(rel)
+        if not p.is_absolute():
+            p = repo / rel
+        try:
+            data = p.read_bytes()
+            st = p.stat()
+            out[str(p)] = {
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "mtime": st.st_mtime,
+                "size": st.st_size,
+            }
+        except OSError:
+            out[str(p)] = {"missing": True}
+    return out
+
+
+def load_data_fingerprint() -> dict:
+    if not DATA_FINGERPRINT_FILE.exists():
+        return {}
+    try:
+        return json.loads(DATA_FINGERPRINT_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_data_fingerprint(state: dict):
+    DATA_FINGERPRINT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DATA_FINGERPRINT_FILE.write_text(json.dumps(state, indent=2, default=str))
+
+
+def check_data_fingerprint() -> tuple[list[dict], dict]:
+    """Compare current fingerprint against the persisted baseline.
+
+    Returns (drifts, current_state).
+      drifts          : list of {target, on_change, changed, missing}
+                         records. Empty on no drift OR first sight.
+      current_state   : dict mapping target name → fingerprint dict.
+
+    Side effects: NONE (caller decides whether to persist + react).
+    First-sight (target has no prior fingerprint on disk) is recorded
+    by the caller via `save_data_fingerprint(current_state)` and does
+    NOT count as drift."""
+    prev = load_data_fingerprint()
+    drifts: list[dict] = []
+    cur_state: dict = {}
+    for t in HARNESS.get("targets", []) or []:
+        cfg = (t.get("dataset_fingerprint") or {})
+        if not cfg.get("paths"):
+            continue
+        name = t.get("name", "?")
+        cur = _compute_data_fingerprint(t)
+        cur_state[name] = cur
+        prev_for_t = prev.get(name)
+        if prev_for_t is None:
+            # First sight — caller will save; not drift.
+            continue
+        changed: list[str] = []
+        missing: list[str] = []
+        for path, meta in cur.items():
+            prev_meta = prev_for_t.get(path)
+            if prev_meta is None:
+                # New path declared after the baseline; treat as changed.
+                changed.append(path)
+                continue
+            if meta.get("missing"):
+                missing.append(path)
+                continue
+            if meta.get("sha256") != prev_meta.get("sha256"):
+                changed.append(path)
+        if changed or missing:
+            drifts.append({
+                "target": name,
+                "on_change": cfg.get("on_change", "alert_only"),
+                "changed": changed,
+                "missing": missing,
+            })
+    return drifts, cur_state
+
+
+def handle_data_fingerprint_drift(drifts: list[dict]) -> str:
+    """Apply on_change policy and return an alert string for the agent
+    prompt.  Empty string if no drift (caller can `if alert:` cheaply)."""
+    if not drifts:
+        return ""
+    lines = ["=== DATASET FINGERPRINT DRIFT DETECTED — ground-truth changed ==="]
+    invalidate = False
+    for d in drifts:
+        lines.append(f"  target={d['target']}  on_change={d['on_change']}")
+        for p in d["changed"]:
+            lines.append(f"    CHANGED  {p}")
+        for p in d["missing"]:
+            lines.append(f"    MISSING  {p}")
+        if d["on_change"] == "invalidate_anchor":
+            invalidate = True
+    if invalidate:
+        sentinel = "inf" if PRIMARY_METRIC_OP == "lt" else "-inf"
+        try:
+            BEST_METRIC_FILE.write_text(sentinel + "\n")
+        except OSError:
+            pass
+        try:
+            if USERPROMPT_HASH_FILE.exists():
+                USERPROMPT_HASH_FILE.unlink()
+        except OSError:
+            pass
+        lines.append(
+            f"  ACTION: best_metric reset to {sentinel} (no valid anchor); "
+            f"userprompt.sha256 cleared to force PROGRAM SYNC."
+        )
+        lines.append(
+            "  → All historical best_val_mae / test_mae records may be "
+            "INVALID for ranking against current data. Treat them as "
+            "rough architectural priors only."
+        )
+        lines.append(
+            "  → Your FIRST plan THIS tick should be a fresh baseline "
+            "rerun on the new dataset (same HP as the prior baseline) "
+            "to establish a comparable anchor BEFORE proposing any new "
+            "axis. Cite this DRIFT alert in the plan motivation."
+        )
+    else:
+        lines.append("  ACTION: alert-only — best_metric and anchor untouched.")
+        lines.append(
+            "  → Be cautious: cross-version comparisons may now be invalid. "
+            "Annotate any plan that mixes pre/post-drift data points."
+        )
+    return "\n".join(lines) + "\n"
+
+
 # ── Training-process detection ──
 
 def _training_in_progress() -> bool:
@@ -971,7 +1143,8 @@ def parse_memory_done(agent_output: str) -> list[str]:
 
 
 def build_agent_prompt(new_results: list[tuple[RunResult, dict | None]],
-                       inflight: list[dict] | None = None) -> str:
+                       inflight: list[dict] | None = None,
+                       data_drift_hint: str = "") -> str:
     # Read B/program.md as-is (B owns it after init; A is template-only).
     # If somehow missing, ensure_* falls back to seeding from A — defensive.
     program_text = ensure_workspace_program_initialized()
@@ -1129,7 +1302,7 @@ IMPORTANT: You are operating in workspace directory: {WORK_DIR}
   (only writable when "PROGRAM SYNC REQUIRED" is signalled).
 - userprompt.yaml is the user's natural-language input — NEVER edit it.
 - All file changes persist in this workspace only; the template is never touched.
-{sync_directive}{memory_directive}{gitnexus_hint}
+{data_drift_hint}{sync_directive}{memory_directive}{gitnexus_hint}
 {surfaces_hint}
 
 === program.md (CONSTRAINTS — MUST OBEY) ===
@@ -1934,6 +2107,17 @@ def run_preflight():
         print(f"[preflight] constitution hash recorded: sha256={h[:16]}… "
               f"-> {PROGRAM_CONST_HASH_FILE}")
 
+    # Bless the current dataset as the fingerprint baseline. Any later
+    # silent swap of train/valid/test files will trigger DATASET DRIFT
+    # on the next tick (per harness.yaml::targets[*].dataset_fingerprint).
+    _, init_fp_state = check_data_fingerprint()
+    if init_fp_state:
+        save_data_fingerprint(init_fp_state)
+        n_paths = sum(len(v) for v in init_fp_state.values())
+        print(f"[preflight] dataset fingerprint baseline recorded: "
+              f"{len(init_fp_state)} target(s), {n_paths} file(s) "
+              f"-> {DATA_FINGERPRINT_FILE}")
+
     print(f"[preflight] next: bash {SERVICE_ROOT}/scripts/install_cron.sh install")
 
 
@@ -1950,6 +2134,19 @@ def run_tick():
         return
 
     check_and_kill_overtime_training()
+
+    # Dataset-fingerprint preflight (silent ground-truth shift detector).
+    # Done BEFORE we look at logs / best_metric so a freshly-detected
+    # drift can reset the anchor before any new comparison happens.
+    drifts, cur_fp_state = check_data_fingerprint()
+    data_drift_hint = handle_data_fingerprint_drift(drifts) if drifts else ""
+    if drifts:
+        n_changed = sum(len(d["changed"]) for d in drifts)
+        n_missing = sum(len(d["missing"]) for d in drifts)
+        print(f"[tick] *** DATASET FINGERPRINT DRIFT: {len(drifts)} target(s), "
+              f"{n_changed} changed, {n_missing} missing — see prompt alert ***")
+    if cur_fp_state:
+        save_data_fingerprint(cur_fp_state)
 
     scan_state = load_scan_state()
     new_logs = find_new_logs(scan_state)
@@ -2057,7 +2254,8 @@ def run_tick():
         return
 
     ensure_gitnexus_index()
-    prompt = build_agent_prompt(new_results, inflight=inflight)
+    prompt = build_agent_prompt(new_results, inflight=inflight,
+                                data_drift_hint=data_drift_hint)
     pending_hash = getattr(build_agent_prompt, "_pending_userprompt_hash", "")
 
     # Snapshot every target repo + workspace BEFORE the agent runs, so the
