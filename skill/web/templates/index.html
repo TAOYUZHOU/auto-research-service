@@ -7,6 +7,11 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({ startOnLoad: false, theme: "default", securityLevel: "loose" });
+  window.__mermaid = mermaid;
+</script>
 <style>
 [x-cloak] { display: none !important; }
 pre.term { background: #0d1117; color: #e6edf3; padding: 1rem;
@@ -26,6 +31,33 @@ pre.zh   { background: #fafafa; color: #1f2937; padding: 1rem;
 .tab-active { border-bottom: 2px solid #2563eb; color: #2563eb; }
 textarea.code { font-family: ui-monospace, monospace; font-size: 12px;
                 line-height: 1.4; }
+.report { background: #ffffff; padding: 1.5rem 2rem; border-radius: 8px;
+          line-height: 1.7; font-size: 14px; color: #111827; }
+.report h1 { font-size: 1.6rem; font-weight: 700; margin: 0.5rem 0 1rem;
+             border-bottom: 1px solid #e5e7eb; padding-bottom: 0.5rem; }
+.report h2 { font-size: 1.25rem; font-weight: 600; margin: 1.5rem 0 0.6rem;
+             color: #1f2937; border-left: 3px solid #2563eb; padding-left: 0.5rem; }
+.report h3 { font-size: 1.05rem; font-weight: 600; margin: 1.2rem 0 0.4rem;
+             color: #374151; }
+.report table { border-collapse: collapse; margin: 0.8rem 0; width: 100%;
+                font-size: 13px; }
+.report th, .report td { border: 1px solid #d1d5db; padding: 6px 10px;
+                          text-align: left; }
+.report th { background: #f3f4f6; font-weight: 600; }
+.report tr:nth-child(even) td { background: #fafafa; }
+.report code { background: #f3f4f6; padding: 1px 4px; border-radius: 3px;
+               font-family: ui-monospace, monospace; font-size: 12px; }
+.report pre { background: #0d1117; color: #e6edf3; padding: 0.8rem;
+              border-radius: 6px; overflow-x: auto; font-size: 12px;
+              line-height: 1.45; }
+.report pre code { background: transparent; color: inherit; padding: 0; }
+.report blockquote { border-left: 4px solid #93c5fd; background: #eff6ff;
+                     padding: 0.4rem 0.8rem; margin: 0.6rem 0;
+                     color: #1e3a8a; font-size: 13px; }
+.report ul, .report ol { padding-left: 1.5rem; margin: 0.4rem 0; }
+.report li { margin: 0.2rem 0; }
+.report .mermaid { background: #f9fafb; padding: 1rem; border-radius: 6px;
+                    text-align: center; margin: 1rem 0; }
 </style>
 </head>
 <body class="bg-gray-50 text-gray-900" x-data="harp()" x-init="init()">
@@ -208,6 +240,10 @@ textarea.code { font-family: ui-monospace, monospace; font-size: 12px;
               class="bg-purple-700 text-white px-4 py-2 rounded disabled:opacity-50 hover:bg-purple-800">
         Polish (force re-do all)
       </button>
+      <button @click="runAction('polish_digest')" :disabled="actionRunning"
+              class="bg-indigo-600 text-white px-4 py-2 rounded disabled:opacity-50 hover:bg-indigo-700">
+        Polish (digest → Report tab)
+      </button>
       <button @click="runAction('doctor')" :disabled="actionRunning"
               class="bg-emerald-600 text-white px-4 py-2 rounded disabled:opacity-50 hover:bg-emerald-700">
         Doctor (10-check health)
@@ -287,6 +323,36 @@ textarea.code { font-family: ui-monospace, monospace; font-size: 12px;
   </div>
 </section>
 
+<section x-show="tab === 'Report'" x-cloak>
+  <div class="bg-white rounded-lg shadow p-4 mb-4 flex items-center justify-between">
+    <div>
+      <h2 class="font-semibold">研究简报 — REPORT.zh.md</h2>
+      <p class="text-xs text-gray-500" x-show="report?.exists">
+        生成于 <span x-text="reportBuiltHuman"></span>
+        <span class="ml-2">（来源：log + memory + plan 三份原文，由独立 cursor-agent 上下文窗口合成）</span>
+      </p>
+      <p class="text-xs text-gray-400" x-show="!report?.exists">
+        尚未生成 — 点右侧按钮即可。
+      </p>
+    </div>
+    <div class="flex items-center gap-2">
+      <button @click="loadReport()" class="text-sm text-gray-600 hover:text-gray-900">reload</button>
+      <button @click="runAction('polish_digest', () => loadReport())"
+              :disabled="actionRunning"
+              class="bg-purple-600 text-white text-sm px-3 py-1 rounded disabled:opacity-50 hover:bg-purple-700">
+        Polish (digest)
+      </button>
+    </div>
+  </div>
+
+  <div class="report" x-html="reportHtml"></div>
+
+  <details class="mt-4 bg-white rounded-lg shadow p-3">
+    <summary class="cursor-pointer text-sm text-gray-600">View raw markdown</summary>
+    <pre class="term mt-2" x-text="report?.text || ''"></pre>
+  </details>
+</section>
+
 </main>
 
 <footer class="text-center text-xs text-gray-400 py-4">
@@ -296,10 +362,12 @@ textarea.code { font-family: ui-monospace, monospace; font-size: 12px;
 <script>
 function harp() {
   return {
-    tabs: ['Dashboard', 'Config', 'Logs', 'Actions', 'Usage'],
+    tabs: ['Dashboard', 'Report', 'Config', 'Logs', 'Actions', 'Usage'],
     tab: 'Dashboard',
     status: null,
     usage: null,
+    report: null,
+    reportHtml: '',
     lastUpdated: '',
     configText: { meta: '', userprompt: '' },
     configStatus: { meta: {}, userprompt: {} },
@@ -313,6 +381,7 @@ function harp() {
     tailing: { tick: false },
     tailOutput: { tick: '' },
     _eventSources: {},
+    _mermaidCounter: 0,
 
     async init() {
       await this.refreshStatus();
@@ -321,6 +390,33 @@ function harp() {
         if (t === 'Config') { this.loadConfig('meta'); this.loadConfig('userprompt'); }
         if (t === 'Logs')   { this.loadFile(this.logKind); }
         if (t === 'Usage')  { this.refreshUsage(); }
+        if (t === 'Report') { this.loadReport(); }
+      });
+    },
+
+    // Render markdown -> HTML, then promote ```mermaid blocks into
+    // <div class="mermaid"> nodes and run mermaid.run() on them.
+    async renderMarkdownWithMermaid(md, targetKey) {
+      // Collect mermaid fences before marked turns them into <pre><code>.
+      const blocks = [];
+      const stripped = md.replace(/```mermaid\n([\s\S]*?)```/g, (_, body) => {
+        const id = 'mmd_' + (++this._mermaidCounter);
+        blocks.push({ id, body });
+        return `\n<div class="mermaid" id="${id}">${body}</div>\n`;
+      });
+      const html = marked.parse(stripped, { breaks: false, gfm: true });
+      this[targetKey] = html;
+      // After Alpine flushes the DOM, ask mermaid to render.
+      this.$nextTick(async () => {
+        if (window.__mermaid && blocks.length) {
+          try {
+            await window.__mermaid.run({
+              nodes: blocks.map(b => document.getElementById(b.id)).filter(Boolean),
+            });
+          } catch (e) {
+            console.warn('mermaid render failed:', e);
+          }
+        }
       });
     },
 
@@ -370,13 +466,24 @@ function harp() {
       if (this.showZh && kind !== 'program') {
         const z = await fetch('/api/files/' + kind + '/zh');
         this.zhText = await z.text();
-        this.zhHtml = marked.parse(this.zhText);
+        await this.renderMarkdownWithMermaid(this.zhText, 'zhHtml');
       } else {
         this.zhText = ''; this.zhHtml = '';
       }
     },
 
-    async runAction(name) {
+    async loadReport() {
+      try {
+        const r = await fetch('/api/report');
+        this.report = await r.json();
+        await this.renderMarkdownWithMermaid(this.report.text || '', 'reportHtml');
+      } catch (e) {
+        this.report = { exists: false, text: '加载失败：' + e.message };
+        this.reportHtml = '<p class="text-red-600">加载失败：' + e.message + '</p>';
+      }
+    },
+
+    async runAction(name, onDone) {
       this.actionOutput = '';
       this.actionRunning = true;
       const r = await fetch('/api/actions/' + name, {method: 'POST'});
@@ -409,6 +516,7 @@ function harp() {
       this.actionRunning = false;
       this.refreshStatus();
       if (name.startsWith('polish')) this.refreshUsage();
+      if (typeof onDone === 'function') onDone();
     },
 
     toggleTail(name) {
@@ -445,6 +553,13 @@ function harp() {
     get lastTickHuman() {
       const a = this.status?.last_tick_age_sec;
       return a == null ? '-' : this.humanDur(a) + ' ago';
+    },
+
+    get reportBuiltHuman() {
+      const a = this.report?.age_sec;
+      if (a == null) return '-';
+      const d = new Date((this.report.built_ts || 0) * 1000);
+      return `${d.toLocaleString()} （${this.humanDur(a)} 前）`;
     },
   };
 }

@@ -221,6 +221,33 @@ async def get_file_zh(kind: str) -> PlainTextResponse:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# /api/report — cross-file research digest (REPORT.zh.md)
+# ─────────────────────────────────────────────────────────────────────
+@app.get("/api/report")
+async def get_report() -> JSONResponse:
+    """Return the current digest with metadata so the UI can show
+    'last built X ago' + a placeholder when not yet built."""
+    p = workspace_dir() / ".state" / "zh" / "REPORT.zh.md"
+    if not p.exists():
+        return JSONResponse({
+            "exists": False,
+            "text": ("# (尚无研究简报)\n\n"
+                     "点击 Actions ▸ **Polish (digest)** 生成 "
+                     "`REPORT.zh.md` —— 它会用一个 fresh cursor-agent "
+                     "上下文窗口合成 log + memory + plan 三份原文。\n\n"
+                     "首次生成约 30-60 秒；之后只在源文件变更后才会重跑。"),
+            "built_ts": None, "age_sec": None,
+        })
+    st = p.stat()
+    return JSONResponse({
+        "exists": True,
+        "text": p.read_text(),
+        "built_ts": int(st.st_mtime),
+        "age_sec": int(time.time() - st.st_mtime),
+    })
+
+
+# ─────────────────────────────────────────────────────────────────────
 # /api/config — meta_info/project.yaml + B/userprompt.yaml (text edit)
 # ─────────────────────────────────────────────────────────────────────
 class ConfigPayload(BaseModel):
@@ -355,6 +382,14 @@ async def action_polish() -> StreamingResponse:
 async def action_polish_force() -> StreamingResponse:
     return _action_response(["bash", str(SKILL_DIR / "scripts" / "harp_polish.sh"),
                              "--once", "--force"])
+
+
+@app.post("/api/actions/polish_digest")
+async def action_polish_digest() -> StreamingResponse:
+    """Build the cross-file research digest (REPORT.zh.md). Skips
+    re-polishing the per-file outputs — only the digest itself."""
+    return _action_response(["bash", str(SKILL_DIR / "scripts" / "harp_polish.sh"),
+                             "--once", "--file", "digest"])
 
 
 @app.post("/api/actions/doctor")
